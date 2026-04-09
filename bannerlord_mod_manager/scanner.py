@@ -2,6 +2,7 @@
 模组扫描器 — 扫描本地 Modules 目录并解析 SubModule.xml
 增强: 基于依赖关系的全局拓扑排序，完美支持 LoadBeforeThis 和 LoadAfterThis
 修复: 避开 __slots__ 限制，使用独立缓存记录排序辅助数据
+优化: 更健壮的 XML 解析，处理编码和格式异常
 """
 
 import os
@@ -30,7 +31,7 @@ OFFICIAL_MOD_PRIORITY = {
 
 class ModScanner:
     """扫描本地 Modules 目录"""
-    
+
     # 用于缓存由于 __slots__ 限制无法附加到 ModInfo 的解析数据
     _extra_data = {}
 
@@ -38,7 +39,7 @@ class ModScanner:
     def scan(mods_path: str) -> list:
         mods = []
         ModScanner._extra_data.clear()  # 每次扫描前清空缓存
-        
+
         if not os.path.isdir(mods_path):
             logger.warning("模组目录不存在: %s", mods_path)
             return mods
@@ -58,11 +59,37 @@ class ModScanner:
         return mods
 
     @staticmethod
+    def _read_xml_safe(xml_path: str):
+        """安全读取并解析 XML，处理 BOM 和编码问题"""
+        import xml.etree.ElementTree as ET
+
+        # 尝试多种编码
+        for encoding in ("utf-8-sig", "utf-8", "gbk", "latin-1"):
+            try:
+                with open(xml_path, "r", encoding=encoding) as f:
+                    content = f.read()
+                # 移除可能残留的 BOM
+                content = content.lstrip('\ufeff')
+                # 修复常见的无效 XML: 无根元素包裹的情况
+                return ET.fromstring(content)
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+            except ET.ParseError as e:
+                # 尝试修复: 移除非法字符后重新解析
+                try:
+                    cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', content)
+                    return ET.fromstring(cleaned)
+                except Exception:
+                    raise e
+
+        # 所有编码都失败，回退到二进制读取
+        with open(xml_path, "rb") as f:
+            return ET.fromstring(f.read())
+
+    @staticmethod
     def _parse_submodule(xml_path: str, folder_name: str, folder_path: str) -> ModInfo:
         try:
-            import xml.etree.ElementTree as ET
-            tree = ET.parse(xml_path)
-            root = tree.getroot()
+            root = ModScanner._read_xml_safe(xml_path)
             module = root.find("Module") if root.tag != "Module" else root
             if module is None:
                 module = root
@@ -157,7 +184,7 @@ class ModScanner:
                 category=category,
                 description=f"从 {folder_name} 目录加载的模组",
                 nexus_id=nexus_id,
-                dependencies=deps,  # 这里只传递模型支持的 deps
+                dependencies=deps,
                 updated=datetime.fromtimestamp(
                     os.path.getmtime(xml_path)
                 ).strftime("%Y-%m-%d"),
@@ -195,45 +222,41 @@ class ModScanner:
         graph = defaultdict(list)
         in_degree = {mid: 0 for mid in all_ids}
 
-        # 1. 注入官方模组的默认优先级边，确保它们之间的相对顺序
+        def _add_edge(u, v):
+            """安全添加边，避免重复"""
+            if u in all_ids and v in all_ids and v not in graph[u]:
+                graph[u].append(v)
+                in_degree[v] += 1
+
+        # 1. 注入官方模组的默认优先级边
         official_mods = sorted(
-            [m for m in mods if ModScanner._extra_data.get(m.mod_id, {}).get("is_official", m.mod_id in OFFICIAL_MOD_PRIORITY)],
+            [m for m in mods if ModScanner._extra_data.get(
+                m.mod_id, {}).get("is_official", m.mod_id in OFFICIAL_MOD_PRIORITY)],
             key=lambda m: OFFICIAL_MOD_PRIORITY.get(m.mod_id, 999)
         )
         for i in range(len(official_mods) - 1):
-            u = official_mods[i].mod_id
-            v = official_mods[i+1].mod_id
-            graph[u].append(v)
-            in_degree[v] += 1
+            _add_edge(official_mods[i].mod_id, official_mods[i + 1].mod_id)
 
         # 2. 解析每个模组的显式依赖
         for mod in mods:
             mid = mod.mod_id
             extra = ModScanner._extra_data.get(mid, {})
-            
+
             # LoadBeforeThis (mod 依赖 dep_id，即 dep_id -> mid)
             for dep_id in mod.dependencies:
-                if dep_id in all_ids:
-                    if mid not in graph[dep_id]:
-                        graph[dep_id].append(mid)
-                        in_degree[mid] += 1
-                        
+                _add_edge(dep_id, mid)
+
             # LoadAfterThis (after_id 依赖 mod，即 mid -> after_id)
-            load_after = extra.get("load_after", [])
-            for after_id in load_after:
-                if after_id in all_ids:
-                    if after_id not in graph[mid]:
-                        graph[mid].append(after_id)
-                        in_degree[after_id] += 1
+            for after_id in extra.get("load_after", []):
+                _add_edge(mid, after_id)
 
         # 初始队列：入度为 0 的模组
         def sort_key(mid):
-            m = mod_map[mid]
-            is_off = ModScanner._extra_data.get(mid, {}).get("is_official", mid in OFFICIAL_MOD_PRIORITY)
+            is_off = ModScanner._extra_data.get(
+                mid, {}).get("is_official", mid in OFFICIAL_MOD_PRIORITY)
             pri = OFFICIAL_MOD_PRIORITY.get(mid, 999) if is_off else 9999
-            return (pri, m.name.lower())
+            return (pri, mod_map[mid].name.lower())
 
-        # 利用 sort_key 优先将官方/核心模组推入排序列表
         queue = sorted(
             [mid for mid in all_ids if in_degree[mid] == 0],
             key=sort_key
@@ -247,10 +270,9 @@ class ModScanner:
                 in_degree[neighbor] -= 1
                 if in_degree[neighbor] == 0:
                     queue.append(neighbor)
-            # 重新排序队列，确保在同等依赖条件下官方优先、字母序稳定
             queue.sort(key=sort_key)
 
-        # 处理循环依赖（如果有的话），把死锁剩余的部分追加到末尾
+        # 处理循环依赖
         if len(sorted_ids) != len(all_ids):
             remaining = [mid for mid in all_ids if mid not in set(sorted_ids)]
             logger.warning(

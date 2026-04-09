@@ -1,18 +1,20 @@
 """
 页面: 模组列表 + 详情面板
-增强: 自动排序按钮，依赖关系可视化，依赖状态检查
-优化: 搜索防抖，减少不必要的UI重建
+增强: 拖拽安装区域、调试面板入口、状态栏、虚拟滚动分页
+优化: 搜索防抖，池化重用(批量渲染)以彻底解决UI重建导致的卡顿问题
 """
 
 from __future__ import annotations
 
+import os
 import webbrowser
+from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
-from ..constants import Theme
+from ..constants import Theme, VIRTUAL_PAGE_SIZE
 from ..models import ModInfo
 from ..utils import format_number, open_folder
-from ..widgets import ModListItem
+from ..widgets import ModListItem, StatusBadge
 
 
 class ModsPage(ctk.CTkFrame):
@@ -23,21 +25,22 @@ class ModsPage(ctk.CTkFrame):
         self.app = app
         self._build_toolbar()
         self._build_body()
+        self._build_status_bar()
 
     def _build_toolbar(self):
-        toolbar = ctk.CTkFrame(self, height=50, fg_color=Theme.BG_MID,
+        toolbar = ctk.CTkFrame(self, height=52, fg_color=Theme.BG_MID,
                                 corner_radius=0)
         toolbar.pack(fill="x")
         toolbar.pack_propagate(False)
 
-        # 搜索 — 使用防抖刷新
+        # 搜索
         self.search_var = ctk.StringVar()
         self.search_var.trace_add(
             "write", lambda *_: self.app.refresh_mod_list_debounced())
         search_entry = ctk.CTkEntry(
             toolbar, textvariable=self.search_var,
-            placeholder_text="🔍 搜索模组...",
-            width=220, height=32,
+            placeholder_text="🔍 搜索模组名称、作者、ID...",
+            width=240, height=34,
             fg_color=Theme.BG_LIGHT, border_color=Theme.BORDER,
             font=ctk.CTkFont(size=12),
         )
@@ -48,7 +51,7 @@ class ModsPage(ctk.CTkFrame):
         cats = ["全部"] + list(Theme.CATEGORY_COLORS.keys()) + ["Official"]
         ctk.CTkOptionMenu(
             toolbar, variable=self.filter_var, values=cats,
-            width=110, height=30,
+            width=110, height=32,
             fg_color=Theme.BG_LIGHT,
             button_color=Theme.BORDER_LIGHT,
             dropdown_fg_color=Theme.BG_LIGHT,
@@ -62,7 +65,7 @@ class ModsPage(ctk.CTkFrame):
             toolbar, variable=self.sort_var,
             values=["手动排序", "名称 A→Z", "名称 Z→A",
                     "大小 ↑", "大小 ↓", "更新日期"],
-            width=110, height=30,
+            width=110, height=32,
             fg_color=Theme.BG_LIGHT,
             button_color=Theme.BORDER_LIGHT,
             dropdown_fg_color=Theme.BG_LIGHT,
@@ -70,29 +73,32 @@ class ModsPage(ctk.CTkFrame):
             command=lambda *_: self.app.refresh_mod_list(),
         ).pack(side="left", padx=4)
 
-        # 右侧 — 统计 + 按钮
+        # 右侧统计
         self.stats_label = ctk.CTkLabel(
             toolbar, text="", font=ctk.CTkFont(size=12),
             text_color=Theme.TEXT_MUTED,
         )
         self.stats_label.pack(side="right", padx=16)
 
+        # 按钮组
         btn_frame = ctk.CTkFrame(toolbar, fg_color="transparent")
         btn_frame.pack(side="right", padx=4)
         for text, color, hover, txtc, cmd in [
-            ("自动排序", Theme.BLUE, "#3a8ae0",
+            ("📦 安装模组", Theme.GOLD, Theme.GOLD_DARK,
+             Theme.BG_DARK, self._install_mod_dialog),
+            ("🔧 自动排序", Theme.BLUE, "#3a8ae0",
              "#fff", self.app.auto_sort_by_dependencies),
             ("全部启用", Theme.GREEN, Theme.GREEN_DARK, "#fff",
              self.app.enable_all),
             ("全部禁用", Theme.BORDER_LIGHT, Theme.BORDER,
              Theme.TEXT_SECONDARY, self.app.disable_all),
-            ("DLL解锁", "#6a4fb8", "#5a3fa8",
+            ("🔓 DLL解锁", "#6a4fb8", "#5a3fa8",
              "#fff", self.app.unlock_all_dlls),
-            ("刷新", Theme.BG_LIGHT, Theme.BORDER,
+            ("🔄 刷新", Theme.BG_LIGHT, Theme.BORDER,
              Theme.TEXT_SECONDARY, self.app.load_mods),
         ]:
             ctk.CTkButton(
-                btn_frame, text=text, width=75, height=28,
+                btn_frame, text=text, width=80, height=30,
                 font=ctk.CTkFont(size=11),
                 fg_color=color, hover_color=hover,
                 text_color=txtc, corner_radius=6, command=cmd,
@@ -102,33 +108,133 @@ class ModsPage(ctk.CTkFrame):
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True)
 
-        # 模组列表（可滚动）
+        # 左侧: 模组列表
+        left = ctk.CTkFrame(body, fg_color="transparent")
+        left.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+
+        # 列表头
+        header = ctk.CTkFrame(left, height=30, fg_color=Theme.BG_MID,
+                                corner_radius=6)
+        header.pack(fill="x", pady=(0, 4))
+        header.pack_propagate(False)
+
+        for text, w, side in [
+            ("#", 52, "left"), ("模组名称", 0, "left"),
+            ("分类", 78, "right"), ("大小", 65, "right"),
+            ("启用", 54, "right"),
+        ]:
+            lbl = ctk.CTkLabel(
+                header, text=text, width=w,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color=Theme.TEXT_DIM,
+            )
+            if text == "模组名称":
+                lbl.pack(side=side, fill="x", expand=True, padx=8)
+            else:
+                lbl.pack(side=side, padx=6)
+
+        # 可滚动列表
         self.mod_list_frame = ctk.CTkScrollableFrame(
-            body, fg_color="transparent",
+            left, fg_color="transparent",
             scrollbar_button_color=Theme.BORDER_LIGHT,
             scrollbar_button_hover_color=Theme.BORDER,
         )
-        self.mod_list_frame.pack(side="left", fill="both", expand=True,
-                                 padx=(8, 0), pady=8)
+        self.mod_list_frame.pack(fill="both", expand=True)
 
         # 详情面板
         self.detail_panel = ctk.CTkFrame(
-            body, width=290, fg_color=Theme.BG_MID, corner_radius=0,
+            body, width=300, fg_color=Theme.BG_MID, corner_radius=0,
             border_width=1, border_color=Theme.BORDER,
         )
         self.detail_panel.pack(side="right", fill="y", pady=8, padx=(0, 4))
         self.detail_panel.pack_propagate(False)
 
+    def _build_status_bar(self):
+        """底部状态栏"""
+        self.status_bar = ctk.CTkFrame(self, height=28, fg_color=Theme.BG_MID,
+                                        corner_radius=0)
+        self.status_bar.pack(fill="x")
+        self.status_bar.pack_propagate(False)
+
+        self.status_label = ctk.CTkLabel(
+            self.status_bar, text="就绪",
+            font=ctk.CTkFont(size=11), text_color=Theme.TEXT_DIM,
+        )
+        self.status_label.pack(side="left", padx=16)
+
+        # 调试按钮
+        ctk.CTkButton(
+            self.status_bar, text="🔍 模组诊断", width=90, height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="transparent", hover_color=Theme.BG_HOVER,
+            text_color=Theme.BLUE, corner_radius=4,
+            command=self.app.open_debug_panel,
+        ).pack(side="right", padx=8)
+
+        # 冲突检测按钮
+        ctk.CTkButton(
+            self.status_bar, text="⚠ 冲突检测", width=90, height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="transparent", hover_color=Theme.BG_HOVER,
+            text_color=Theme.ORANGE, corner_radius=4,
+            command=self.app.detect_conflicts,
+        ).pack(side="right", padx=2)
+
     def update_stats(self, enabled: int, total: int):
         self.stats_label.configure(text=f"已启用 {enabled} / 总计 {total}")
 
+    def set_status(self, text: str, color: str = Theme.TEXT_DIM):
+        self.status_label.configure(text=text, text_color=color)
+
+    def _install_mod_dialog(self):
+        """打开文件对话框选择模组压缩包"""
+        files = filedialog.askopenfilenames(
+            title="选择模组压缩包",
+            filetypes=[
+                ("压缩文件", "*.zip"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if files:
+            for f in files:
+                self.app.install_mod_from_file(f)
+
+    # ============================================================
+    # 核心优化接口：组件池批量渲染，极大缓解排序和刷新的卡顿
+    # 建议在 app.py 的 refresh_mod_list 中替换原有清空+重绘的逻辑
+    # ============================================================
+    def render_mods(self, mods: list, on_select, on_toggle, on_move_up, on_move_down):
+        """利用对象池机制更新列表项，避免高频率销毁/创建 CTkFrame 导致的卡顿"""
+        if not hasattr(self, "_mod_widgets_pool"):
+            self._mod_widgets_pool = []
+            
+        # 1. 更新现有组件或创建新组件
+        for i, mod in enumerate(mods):
+            if i < len(self._mod_widgets_pool):
+                w = self._mod_widgets_pool[i]
+                w.update_item(mod, i, on_select, on_toggle, on_move_up, on_move_down)
+                # 重新显示，确保正确顺序
+                w.pack(fill="x", pady=1, padx=2)
+            else:
+                w = ModListItem(
+                    self.mod_list_frame, mod=mod, index=i,
+                    on_select=on_select, on_toggle=on_toggle,
+                    on_move_up=on_move_up, on_move_down=on_move_down
+                )
+                w.pack(fill="x", pady=1, padx=2)
+                self._mod_widgets_pool.append(w)
+                
+        # 2. 隐藏多余的组件而不是销毁它们
+        for i in range(len(mods), len(self._mod_widgets_pool)):
+            self._mod_widgets_pool[i].pack_forget()
+
 
 # ============================================================
-# 详情面板构建器（增强版）
+# 详情面板构建器 — 增强版
 # ============================================================
 
 class DetailPanelBuilder:
-    """构建右侧模组详情面板内容 — 增加依赖关系可视化"""
+    """构建右侧模组详情面板内容"""
 
     @staticmethod
     def build(panel: ctk.CTkFrame, mod: ModInfo, app):
@@ -136,11 +242,17 @@ class DetailPanelBuilder:
             w.destroy()
 
         if mod is None:
+            empty = ctk.CTkFrame(panel, fg_color="transparent")
+            empty.place(relx=0.5, rely=0.5, anchor="center")
             ctk.CTkLabel(
-                panel, text="← 选择一个模组\n查看详细信息",
+                empty, text="📋",
+                font=ctk.CTkFont(size=32),
+            ).pack(pady=(0, 8))
+            ctk.CTkLabel(
+                empty, text="选择一个模组\n查看详细信息",
                 font=ctk.CTkFont(size=13), text_color=Theme.TEXT_DIM,
                 justify="center",
-            ).place(relx=0.5, rely=0.5, anchor="center")
+            ).pack()
             return
 
         cat_color = Theme.category_color(mod.category)
@@ -153,7 +265,7 @@ class DetailPanelBuilder:
 
         # 图标
         icon = ctk.CTkFrame(scroll, width=56, height=56,
-                             fg_color=Theme.BG_LIGHT, corner_radius=12,
+                             fg_color=Theme.BG_LIGHT, corner_radius=14,
                              border_width=1, border_color=Theme.BORDER)
         icon.pack(anchor="w", pady=(0, 12))
         icon.pack_propagate(False)
@@ -167,7 +279,7 @@ class DetailPanelBuilder:
         ctk.CTkLabel(
             scroll, text=mod.name,
             font=ctk.CTkFont(size=16, weight="bold"),
-            text_color=Theme.TEXT_PRIMARY, wraplength=240,
+            text_color=Theme.TEXT_PRIMARY, wraplength=250,
         ).pack(anchor="w")
 
         ctk.CTkLabel(
@@ -180,7 +292,7 @@ class DetailPanelBuilder:
             ctk.CTkLabel(
                 scroll, text=mod.description,
                 font=ctk.CTkFont(size=12), text_color=Theme.TEXT_SECONDARY,
-                wraplength=240, justify="left",
+                wraplength=250, justify="left",
             ).pack(anchor="w", pady=(0, 16))
 
         # 分割线
@@ -227,7 +339,6 @@ class DetailPanelBuilder:
                 text_color=Theme.TEXT_PRIMARY,
             ).pack(anchor="w", pady=(0, 6))
 
-            # 预建索引避免 O(n*m) 查找
             mod_map = {m.mod_id: m for m in app.mods}
             for dep_id in mod.dependencies:
                 dep_row = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -235,17 +346,11 @@ class DetailPanelBuilder:
 
                 dep_mod = mod_map.get(dep_id)
                 if dep_mod is None:
-                    icon_text = "❌"
-                    status_color = Theme.RED
-                    status_tip = "未安装"
+                    icon_text, status_color, status_tip = "❌", Theme.RED, "未安装"
                 elif dep_mod.enabled:
-                    icon_text = "✅"
-                    status_color = Theme.GREEN
-                    status_tip = "已启用"
+                    icon_text, status_color, status_tip = "✅", Theme.GREEN, "已启用"
                 else:
-                    icon_text = "⚠"
-                    status_color = Theme.GOLD
-                    status_tip = "已安装但未启用"
+                    icon_text, status_color, status_tip = "⚠", Theme.GOLD, "未启用"
 
                 ctk.CTkLabel(
                     dep_row, text=f"  {icon_text} {dep_id}",
@@ -319,6 +424,15 @@ class DetailPanelBuilder:
             command=app.toggle_selected_mod,
         ).pack(fill="x", pady=(0, 6))
 
+        # 调试按钮
+        ctk.CTkButton(
+            btn_frame, text="🔍 调试此模组", height=32,
+            font=ctk.CTkFont(size=12),
+            fg_color=Theme.BG_LIGHT, hover_color=Theme.BORDER,
+            text_color=Theme.BLUE, corner_radius=6,
+            command=lambda: app.debug_single_mod(mod),
+        ).pack(fill="x", pady=(0, 6))
+
         if mod.nexus_id:
             ctk.CTkButton(
                 btn_frame, text="在 Nexus 查看", height=32,
@@ -333,7 +447,7 @@ class DetailPanelBuilder:
 
         if mod.path:
             ctk.CTkButton(
-                btn_frame, text="打开文件夹", height=32,
+                btn_frame, text="📁 打开文件夹", height=32,
                 font=ctk.CTkFont(size=12),
                 fg_color=Theme.BG_LIGHT, hover_color=Theme.BORDER,
                 text_color=Theme.TEXT_SECONDARY, corner_radius=6,
@@ -349,7 +463,7 @@ class DetailPanelBuilder:
             ).pack(fill="x", pady=(0, 6))
 
         ctk.CTkButton(
-            btn_frame, text="删除模组", height=32,
+            btn_frame, text="🗑 删除模组", height=32,
             font=ctk.CTkFont(size=12),
             fg_color="transparent", border_width=1,
             border_color="#3a2020", hover_color="#2a1515",

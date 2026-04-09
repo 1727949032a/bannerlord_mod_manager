@@ -80,22 +80,21 @@ class SimpleModExtractor:
         return mods, total
 
 class ChineseSiteAPI:
+    def __init__(self):
+        self._cookies = None
+
     @staticmethod
     def open_site():
         import webbrowser
         webbrowser.open(BASE_URL)
-        
-    def __init__(self):
-        self._cookies = ""
-
-    def set_cookies(self, cookies: str):
-        self._cookies = cookies
 
     def _make_request(self, url: str, data: bytes = None, method: str = "GET") -> str:
         try:
             req = urllib.request.Request(url, data=data, method=method)
             req.add_header("User-Agent", USER_AGENT)
-            if self._cookies: req.add_header("Cookie", self._cookies)
+            if getattr(self, "_cookies", None): 
+                req.add_header("Cookie", self._cookies)
+                
             with urllib.request.urlopen(req, timeout=20) as resp:
                 charset = resp.headers.get_content_charset() or "utf-8"
                 return resp.read().decode(charset, errors="replace")
@@ -116,30 +115,36 @@ class ChineseSiteAPI:
         return SimpleModExtractor.extract_from_html(self._make_request(url))
 
     def get_mod_detail(self, url: str) -> dict:
-        """获取模组详情页信息，包括完整介绍、元数据、评论和评分"""
+        """获取模组详情页信息，包括完整介绍、封面、元数据、评论等"""
         html = self._make_request(url)
         if not html: return {}
 
         detail = {"url": url, "comments": [], "download_links": [], "images": [], "meta": {}}
 
-        # 提取标题
+        # ---- 提取封面图 (左侧封面区) ----
+        cover_m = re.search(r'<div id="viewminileft">.*?<img[^>]*src="([^"]+)"', html, re.DOTALL)
+        if cover_m:
+            img_url = cover_m.group(1)
+            detail["cover"] = img_url if img_url.startswith("http") else f"{BASE_URL}/{img_url}"
+
+        # ---- 提取标题 ----
         title_m = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL)
         if title_m:
             detail["title"] = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
 
         # ---- 提取元数据信息卡 ----
         # 作者
-        author_m = re.search(r'作者[：:]\s*(?:<[^>]*>)*\s*([^<\s]+)', html)
+        author_m = re.search(r'作者[：:]\s*(?:<[^>]*>)*\s*([^<]+)', html)
         if author_m:
             detail["meta"]["author"] = author_m.group(1).strip()
 
         # 分类
-        cat_m = re.search(r'分类[：:]\s*(?:<[^>]*>)*\s*([^<\s]+)', html)
+        cat_m = re.search(r'分类[：:]\s*(?:<[^>]*>)*\s*([^<]+)', html)
         if cat_m:
             detail["meta"]["category"] = cat_m.group(1).strip()
 
         # 来源
-        src_m = re.search(r'来源[：:]\s*(?:<[^>]*>)*\s*([^<\s]+)', html)
+        src_m = re.search(r'来源[：:]\s*(?:<[^>]*>)*\s*([^<]+)', html)
         if src_m:
             detail["meta"]["source"] = src_m.group(1).strip()
 
@@ -169,17 +174,17 @@ class ChineseSiteAPI:
             detail["meta"]["date"] = date_m.group(1)
 
         # 文件大小
-        size_m = re.search(r'大小[：:]\s*([\d.]+\s*[KMGT]?B)', html, re.IGNORECASE)
+        size_m = re.search(r'大小[：:]\s*(?:<[^>]*>)*\s*([\d.]+\s*[KMGT]?B)', html, re.IGNORECASE)
         if size_m:
             detail["meta"]["file_size"] = size_m.group(1).strip()
 
         # 适用版本
-        ver_m = re.search(r'(?:适用版本|游戏版本|兼容版本)[：:]\s*([^<\n]+)', html)
+        ver_m = re.search(r'(?:适用版本|游戏版本|兼容版本|版本)[：:]\s*(?:<[^>]*>)*\s*([^<]+)', html)
         if ver_m:
             detail["meta"]["game_version"] = ver_m.group(1).strip()
 
         # ---- 提取评分 ----
-        score_m = re.search(r'总体评分[：:]\s*(?:<[^>]*>)*\s*([\d.]+)', html)
+        score_m = re.search(r'总体评[价分][：:]\s*(?:<[^>]*>)*\s*([\d.]+)', html)
         if score_m:
             try:
                 detail["meta"]["score"] = float(score_m.group(1))
@@ -187,7 +192,7 @@ class ChineseSiteAPI:
                 pass
 
         # 评分人数
-        score_count_m = re.search(r'(\d+)\s*(?:人评分|个评分|人评价)', html)
+        score_count_m = re.search(r'(\d+)\s*(?:人评分|个评分|次点评)', html)
         if score_count_m:
             detail["meta"]["score_count"] = int(score_count_m.group(1))
 
@@ -196,7 +201,6 @@ class ChineseSiteAPI:
         if desc_m:
             raw_html = desc_m.group(1)
 
-            # 提取内容中的图片
             for img_m in re.finditer(r'<img[^>]*src="([^"]+)"[^>]*>', raw_html):
                 img_url = img_m.group(1)
                 if img_url.startswith("http") or img_url.startswith("//"):
@@ -206,20 +210,15 @@ class ChineseSiteAPI:
                 elif not img_url.startswith("data:"):
                     detail["images"].append(f"{BASE_URL}/{img_url}")
 
-            # 剥离脚本和样式
             clean_text = re.sub(r'<style[^>]*>.*?</style>', '', raw_html, flags=re.DOTALL)
             clean_text = re.sub(r'<script[^>]*>.*?</script>', '', clean_text, flags=re.DOTALL)
-            # 转换换行标签
             clean_text = re.sub(r'<br\s*/?>', '\n', clean_text)
             clean_text = re.sub(r'<p[^>]*>', '\n', clean_text)
             clean_text = re.sub(r'<li[^>]*>', '\n• ', clean_text)
             clean_text = re.sub(r'<h\d[^>]*>', '\n【', clean_text)
             clean_text = re.sub(r'</h\d>', '】\n', clean_text)
-            # 清除所有HTML标签
             clean_text = re.sub(r'<[^>]+>', '', clean_text)
-            # 替换HTML实体
             detail["description"] = html_lib.unescape(clean_text).strip()
-            # 删除多余空行
             detail["description"] = re.sub(r'\n\s*\n', '\n\n', detail["description"])
 
         # ---- 提取更新日志/更新记录 ----
@@ -260,7 +259,6 @@ class ChineseSiteAPI:
             author_m = re.search(r'<h4>(.*?)</h4>', block)
             time_m = re.search(r'<span class="time">\s*(.*?)\s*</span>', block, re.DOTALL)
             
-            # 提取评分星级
             rating = 0
             rating_m = re.search(r'总体评[价分][：:]\s*(?:<[^>]*>)*\s*([\d.]+)', block)
             if rating_m:

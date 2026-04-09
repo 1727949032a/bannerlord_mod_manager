@@ -1,36 +1,194 @@
 """
 Nexus Mods API 封装
-增强: 增加用户验证(合规要求)、Free/Premium 分流下载逻辑，移除 Demo 依赖
+增强: 支持 OAuth 2.0 + PKCE 验证 (替换旧版 API Key)，合规要求、Free/Premium 分流下载逻辑
 """
 
+import os
 import json
 import time
+import base64
+import hashlib
 import webbrowser
 import logging
 import urllib.request
 import urllib.parse
-from typing import Optional, Dict, Any
+import http.server
+from typing import Optional, Dict, Any, Tuple
+
+from .constants import APP_VERSION
 
 logger = logging.getLogger("BannerlordModManager")
 
 
+class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    """临时本地 HTTP 服务器回调处理，用于接收 OAuth Code"""
+    def do_GET(self):
+        query = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(query)
+        self.server.oauth_code = params.get('code', [None])[0]
+
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
+        
+        if self.server.oauth_code:
+            html = "<h1>授权成功！</h1><p>您现在可以关闭此窗口并返回模组管理器。</p>"
+        else:
+            html = "<h1>授权取消或失败</h1><p>未获取到授权码。您可以关闭此窗口并重试。</p>"
+        
+        self.wfile.write(html.encode('utf-8'))
+
+    def log_message(self, format, *args):
+        pass  # 屏蔽终端访问日志
+
+
 class NexusAPI:
-    """Nexus Mods API 封装 — 合规增强版"""
+    """Nexus Mods API 封装 — OAuth 2.0 / PKCE 合规增强版"""
 
     GAME_DOMAIN = "mountandblade2bannerlord"
     BASE_URL = "https://api.nexusmods.com/v1"
     SEARCH_URL = "https://search.nexusmods.com/mods"
+    OAUTH_BASE_URL = "https://users.nexusmods.com/oauth"
 
-    def __init__(self, api_key: str = ""):
-        self.api_key = api_key
+    def __init__(self, client_id: str = "bannerlord_mod_manager", redirect_uri: str = "http://127.0.0.1:8089/callback"):
+        self.client_id = client_id
+        self.redirect_uri = redirect_uri
+        
+        self.access_token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
+        self.expires_at: float = 0
+        self.current_verifier: Optional[str] = None
+
         self._cache: dict = {}
-        self._cache_ttl = 300  # 缓存 5 分钟
-        self.user_info: Optional[dict] = None  # 存储用户验证信息
+        self._cache_ttl = 300
+        self.user_info: Optional[dict] = None
+        
+        # 回调函数，用于外部(如 App)保存 token 到 config
+        self.on_token_update = None
 
-    def set_api_key(self, key: str):
-        self.api_key = key
+    @property
+    def has_valid_token(self) -> bool:
+        """检查是否有存活的 Access Token 记录"""
+        return bool(self.access_token)
+
+    def set_tokens(self, access_token: str, refresh_token: str, expires_at: float):
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.expires_at = expires_at
         self._cache.clear()
-        self.user_info = None  # 切换 key 后清空用户信息
+        self.user_info = None
+
+    def logout(self):
+        """注销"""
+        self.access_token = None
+        self.refresh_token = None
+        self.expires_at = 0
+        self.user_info = None
+        self.clear_cache()
+        if callable(self.on_token_update):
+            self.on_token_update(None, None, 0)
+
+    def _generate_pkce_pair(self) -> Tuple[str, str]:
+        verifier_bytes = os.urandom(32)
+        verifier = base64.urlsafe_b64encode(verifier_bytes).decode('utf-8').rstrip('=')
+        digest = hashlib.sha256(verifier.encode('ascii')).digest()
+        challenge = base64.urlsafe_b64encode(digest).decode('utf-8').rstrip('=')
+        return verifier, challenge
+
+    def get_authorize_url(self) -> str:
+        verifier, challenge = self._generate_pkce_pair()
+        self.current_verifier = verifier
+        state = os.urandom(16).hex()
+        
+        params = {
+            "client_id": self.client_id,
+            "response_type": "code",
+            "scope": "",
+            "redirect_uri": self.redirect_uri,
+            "state": state,
+            "code_challenge_method": "S256",
+            "code_challenge": challenge
+        }
+        return f"{self.OAUTH_BASE_URL}/authorize?{urllib.parse.urlencode(params)}"
+
+    def exchange_code_for_tokens(self, code: str) -> dict:
+        if not self.current_verifier:
+            raise ValueError("缺少 PKCE verifier。")
+
+        params = {
+            "grant_type": "authorization_code",
+            "redirect_uri": self.redirect_uri,
+            "client_id": self.client_id,
+            "code": code,
+            "code_verifier": self.current_verifier
+        }
+        return self._do_token_request(params)
+
+    def perform_oauth_flow(self) -> bool:
+        """一键触发浏览器授权和本地接收流程"""
+        url = self.get_authorize_url()
+        
+        # 启动本地服务器等待回调
+        server = http.server.HTTPServer(('127.0.0.1', 8089), OAuthCallbackHandler)
+        server.oauth_code = None
+        server.timeout = 180  # 3分钟超时，防止阻塞过久
+        
+        webbrowser.open(url)
+        server.handle_request()  # 阻塞并等待浏览器重定向访问
+        
+        code = server.oauth_code
+        server.server_close()
+        
+        if code:
+            self.exchange_code_for_tokens(code)
+            return True
+        return False
+
+    def _refresh_access_token(self):
+        if not self.refresh_token:
+            return
+
+        params = {
+            "grant_type": "refresh_token",
+            "client_id": self.client_id,
+            "refresh_token": self.refresh_token
+        }
+        
+        logger.info("Access Token 刷新中...")
+        try:
+            self._do_token_request(params)
+        except Exception as exc:
+            logger.error("Token 刷新失败: %s", exc)
+            self.logout()
+
+    def _do_token_request(self, params: dict) -> dict:
+        data = urllib.parse.urlencode(params).encode("utf-8")
+        req = urllib.request.Request(f"{self.OAUTH_BASE_URL}/token", data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                
+            self.access_token = result.get("access_token")
+            self.refresh_token = result.get("refresh_token")
+            
+            expires_in = result.get("expires_in", 3600)
+            self.expires_at = time.time() + expires_in - 60
+            
+            if callable(self.on_token_update):
+                self.on_token_update(self.access_token, self.refresh_token, self.expires_at)
+                
+            return result
+        except urllib.error.HTTPError as exc:
+            logger.error("OAuth Token 请求失败: %s - %s", exc.code, exc.reason)
+            raise
+
+    def check_and_refresh_token(self):
+        if not self.access_token:
+            return
+        if time.time() >= self.expires_at:
+            self._refresh_access_token()
 
     def _get_cached(self, key: str):
         if key in self._cache:
@@ -44,7 +202,11 @@ class NexusAPI:
         self._cache[key] = (time.time(), data)
 
     def _request(self, endpoint: str, use_cache: bool = True) -> Optional[list | dict]:
-        if not self.api_key:
+        if not self.has_valid_token:
+            return None
+
+        self.check_and_refresh_token()
+        if not self.has_valid_token:
             return None
 
         cache_key = f"api:{endpoint}"
@@ -56,104 +218,57 @@ class NexusAPI:
         try:
             url = f"{self.BASE_URL}{endpoint}"
             req = urllib.request.Request(url)
-            req.add_header("apikey", self.api_key)
+            req.add_header("Authorization", f"Bearer {self.access_token}")
             req.add_header("Accept", "application/json")
-            req.add_header("Application-Name", "BannerlordModManager") # 建议添加应用名
-            req.add_header("Application-Version", "1.0.0")
-            
+            req.add_header("Application-Name", "BannerlordModManager")
+            req.add_header("Application-Version", APP_VERSION)
+
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             if use_cache:
                 self._set_cache(cache_key, data)
             return data
-        except Exception as exc:
-            logger.error("Nexus API 请求错误 (%s): %s", endpoint, exc)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                logger.error("Token 失效")
+                self.logout()
             return None
-
-    # ================================================================
-    # 用户合规验证 (API 政策要求)
-    # ================================================================
+        except Exception as exc:
+            logger.error("API 请求错误: %s", exc)
+            return None
 
     def validate_user(self) -> Optional[dict]:
-        """
-        验证 API Key 并获取用户状态 (Free vs Premium)。
-        这是符合 Nexus API 政策的核心步骤。
-        """
-        if not self.api_key:
+        if not self.has_valid_token:
             return None
-            
         data = self._request("/users/validate.json", use_cache=False)
         if data:
             self.user_info = data
-            logger.info("用户验证成功. Premium状态: %s", self.is_premium)
         return data
 
     @property
     def is_premium(self) -> bool:
-        """判断当前用户是否为高级会员"""
         if not self.user_info:
             return False
         return self.user_info.get("is_premium", False)
 
-    # ================================================================
-    # 合规下载逻辑 (API 政策要求)
-    # ================================================================
-
     def get_compliant_download_action(self, mod_id: int, file_id: int) -> Dict[str, Any]:
-        """
-        根据用户权限返回合规的下载动作。
-        返回字典: {"type": "direct_url" | "browser", "url": str}
-        """
-        # 如果尚未验证用户，先验证一次
         if self.user_info is None:
             self.validate_user()
 
         if self.is_premium:
-            # Premium 用户：调用 API 获取真实直链进行静默下载
             links = self._request(
                 f"/games/{self.GAME_DOMAIN}/mods/{mod_id}/files/{file_id}/download_link.json",
                 use_cache=False
             )
             if links and isinstance(links, list) and len(links) > 0:
-                return {
-                    "type": "direct_url",
-                    "url": links[0].get("URI")
-                }
+                url = links[0].get("URI")
+                if url:
+                    return {"type": "direct_url", "url": url}
 
-        # Free 用户 (或获取直链失败)：引导至网页进行手动合规下载
         fallback_url = f"https://www.nexusmods.com/{self.GAME_DOMAIN}/mods/{mod_id}?tab=files"
-        return {
-            "type": "browser",
-            "url": fallback_url
-        }
+        return {"type": "browser", "url": fallback_url}
 
-    # ================================================================
-    # 基础 API 端点
-    # ================================================================
-
-    def get_trending(self) -> Optional[list]:
-        return self._request(f"/games/{self.GAME_DOMAIN}/mods/trending.json")
-
-    def get_latest(self) -> Optional[list]:
-        return self._request(f"/games/{self.GAME_DOMAIN}/mods/latest_added.json")
-
-    def get_latest_updated(self) -> Optional[list]:
-        return self._request(f"/games/{self.GAME_DOMAIN}/mods/latest_updated.json")
-
-    def get_mod_info(self, mod_id: int) -> Optional[dict]:
-        return self._request(f"/games/{self.GAME_DOMAIN}/mods/{mod_id}.json")
-
-    def get_mod_files(self, mod_id: int) -> Optional[dict]:
-        return self._request(f"/games/{self.GAME_DOMAIN}/mods/{mod_id}/files.json")
-
-    # ================================================================
-    # 搜索（使用 Nexus 公开搜索 API，无需 API Key）
-    # ================================================================
-
-    def search_mods_api(self, query: str, page: int = 1,
-                        sort: str = "endorsements",
-                        page_size: int = 20) -> tuple:
-        """通过 Nexus 搜索端点获取模组列表，无需 API Key"""
+    def search_mods_api(self, query: str, page: int = 1, sort: str = "endorsements", page_size: int = 20) -> tuple:
         cache_key = f"search:{query}:{page}:{sort}:{page_size}"
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -170,8 +285,8 @@ class NexusAPI:
             url = f"{self.SEARCH_URL}?{urllib.parse.urlencode(params)}"
             req = urllib.request.Request(url)
             req.add_header("Accept", "application/json")
-            req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            
+            req.add_header("User-Agent", "Mozilla/5.0")
+
             with urllib.request.urlopen(req, timeout=15) as resp:
                 raw = json.loads(resp.read().decode("utf-8"))
 
@@ -185,20 +300,16 @@ class NexusAPI:
                 "updated": lambda m: m.get("updated_time", 0),
             }
             sort_fn = sort_map.get(sort, sort_map["endorsements"])
-            reverse = sort != "name"
-            results.sort(key=sort_fn, reverse=reverse)
+            results.sort(key=sort_fn, reverse=(sort != "name"))
 
             start = (page - 1) * page_size
-            end = start + page_size
-            page_results = results[start:end]
+            page_results = results[start:start + page_size]
 
             converted = self._convert_search_results(page_results)
             result = (converted, total)
             self._set_cache(cache_key, result)
             return result
-
-        except Exception as exc:
-            logger.error("Nexus 搜索失败: %s", exc)
+        except Exception:
             return ([], 0)
 
     def _convert_search_results(self, results: list) -> list:
@@ -218,12 +329,7 @@ class NexusAPI:
             })
         return converted
 
-    # ================================================================
-    # 通过 v1 API 获取完整列表（需 API Key）
-    # ================================================================
-
-    def fetch_mods_by_type(self, mod_type: str = "trending",
-                           page_size: int = 20, page: int = 1) -> tuple:
+    def fetch_mods_by_type(self, mod_type: str = "trending", page_size: int = 20, page: int = 1) -> tuple:
         cache_key = f"type:{mod_type}"
         cached_all = self._get_cached(cache_key)
 
@@ -242,21 +348,7 @@ class NexusAPI:
 
         total = len(cached_all)
         start = (page - 1) * page_size
-        end = start + page_size
-        return (cached_all[start:end], total)
-
-    # ================================================================
-    # 浏览器搜索
-    # ================================================================
-
-    def open_in_browser(self, query: str):
-        url = (f"https://www.nexusmods.com/{self.GAME_DOMAIN}"
-               f"/search/?gsearch={urllib.parse.quote(query)}&gsearchtype=mods")
-        webbrowser.open(url)
-
-    # ================================================================
-    # 辅助方法
-    # ================================================================
+        return (cached_all[start:start + page_size], total)
 
     @staticmethod
     def convert_api_data(raw_list: list) -> list:
@@ -280,14 +372,11 @@ class NexusAPI:
 
     @staticmethod
     def _map_category(cat) -> str:
-        if isinstance(cat, str):
-            return cat if cat else "Misc"
-        cat_map = {
-            1: "Overhaul", 2: "Gameplay", 3: "Items",
-            4: "UI", 5: "Character", 6: "Tweaks",
-            7: "Total Conversion", 8: "Audio", 9: "Misc",
-        }
-        return cat_map.get(cat, "Misc")
+        if isinstance(cat, str): return cat if cat else "Misc"
+        return {
+            1: "Overhaul", 2: "Gameplay", 3: "Items", 4: "UI", 5: "Character",
+            6: "Tweaks", 7: "Total Conversion", 8: "Audio", 9: "Misc"
+        }.get(cat, "Misc")
 
     def clear_cache(self):
         self._cache.clear()
